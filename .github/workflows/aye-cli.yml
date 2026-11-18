@@ -1,0 +1,134 @@
+name: Build AYE CLI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/aye-cli.yml"
+      - "scripts/**"
+      - "tests/**"
+      - "README.md"
+      - "SECURITY.md"
+  pull_request:
+    paths:
+      - ".github/workflows/aye-cli.yml"
+      - "scripts/**"
+      - "tests/**"
+  workflow_dispatch:
+    inputs:
+      gitlab_sha:
+        description: "Optional exact 40-character GitLab main commit SHA (blank: protected main HEAD)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "aye-cli-${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  validate-builder:
+    name: Validate build contract and negative tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout public build recipes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Setup pinned Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "26.13.1"
+      - name: Validate JS and shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/checkout-source.sh
+          for script in scripts/*.mjs tests/*.mjs; do node --check "$script"; done
+      - name: Unit tests including negative admission tests
+        run: node --test tests/*.test.mjs
+
+  resolve-source:
+    name: Admit green protected GitLab SHA
+    needs: [validate-builder]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source_sha: "${{ steps.source.outputs.source_sha }}"
+      pipeline_id: "${{ steps.source.outputs.pipeline_id }}"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "26.13.1"
+      - name: Resolve immutable source SHA and successful CI
+        id: source
+        env:
+          GITLAB_READ_TOKEN: "${{ secrets.GITLAB_READ_TOKEN }}"
+          REQUESTED_GITLAB_SHA: "${{ inputs.gitlab_sha }}"
+        run: node scripts/resolve-source.mjs
+
+  build-native:
+    name: Native ${{ matrix.target }}
+    needs: [resolve-source]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+          - runner: macos-15
+            target: macos-arm64
+    runs-on: "${{ matrix.runner }}"
+    timeout-minutes: 45
+    env:
+      AYE_SOURCE_SHA: "${{ needs.resolve-source.outputs.source_sha }}"
+      AYE_PIPELINE_ID: "${{ needs.resolve-source.outputs.pipeline_id }}"
+      AYE_TARGET: "${{ matrix.target }}"
+    steps:
+      - name: Checkout public build recipes (without GitHub credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Setup exact Node 26 runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "26.13.1"
+      - name: Check native runner platform
+        run: |
+          node -e "import('./scripts/build-native.mjs').then(m => { if(m.targetFor(process.platform,process.arch)!==process.env.AYE_TARGET) process.exit(2) })"
+      - name: Checkout private canonical GitLab source (read only, ephemeral credentials)
+        shell: bash
+        env:
+          GITLAB_READ_TOKEN: "${{ secrets.GITLAB_READ_TOKEN }}"
+        run: bash scripts/checkout-source.sh
+      - name: Install frozen TypeScript compiler and AYE dependencies
+        working-directory: .private-gitlab-src
+        run: npm ci --ignore-scripts --no-audit --no-fund --no-progress
+      - name: Typecheck canonical implementation
+        working-directory: .private-gitlab-src
+        run: npm run typecheck
+      - name: Build native standalone Node SEA
+        run: node scripts/build-native.mjs
+      - name: Verify exact binary and negative guards
+        run: node scripts/verify-native.mjs
+      - name: Package verified developer pilot and checksums
+        run: node scripts/package-native.mjs
+      - name: Upload native artifacts only (never private source)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: "aye-cli-${{ matrix.target }}-${{ needs.resolve-source.outputs.source_sha }}"
+          path: "release/${{ matrix.target }}/"
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
