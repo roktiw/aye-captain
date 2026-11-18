@@ -1,0 +1,116 @@
+name: AYE Captain macOS ARM64 developer pilot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/aye-cli-macos-pilot.yml"
+  workflow_dispatch:
+    inputs:
+      gitlab_sha:
+        description: "Green, protected GitLab main SHA. Empty = pinned pilot SHA."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aye-cli-macos-pilot-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-arm64:
+    name: Build and smoke-test native macOS arm64 AYE CLI
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      AYE_TARGET: macos-arm64
+    steps:
+      - name: Checkout public packaging recipes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Pinned Node.js 26 runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "26.13.1"
+
+      - name: Verify build scripts and negative tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/checkout-source.sh
+          for script in scripts/*.mjs tests/*.mjs; do node --check "$script"; done
+          node --test tests/*.test.mjs
+          node -e "import('./scripts/build-native.mjs').then(m => { if(m.targetFor(process.platform,process.arch)!=='macos-arm64') process.exit(2) })"
+
+      - name: Admit exact protected GitLab source SHA with green pipeline
+        id: source
+        env:
+          GITLAB_READ_TOKEN: "${{ secrets.GITLAB_READ_TOKEN }}"
+          REQUESTED_GITLAB_SHA: "${{ inputs.gitlab_sha || 'ba43fb90a87af24f0b46fc0d127a9cb38d162089' }}"
+        run: node scripts/resolve-source.mjs
+
+      - name: Export source provenance for builder
+        shell: bash
+        env:
+          SHA: "${{ steps.source.outputs.source_sha }}"
+          PIPELINE_ID: "${{ steps.source.outputs.pipeline_id }}"
+        run: |
+          echo "AYE_SOURCE_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "AYE_PIPELINE_ID=$PIPELINE_ID" >> "$GITHUB_ENV"
+
+      - name: Checkout private GitLab main source at admitted SHA
+        shell: bash
+        env:
+          GITLAB_READ_TOKEN: "${{ secrets.GITLAB_READ_TOKEN }}"
+        run: bash scripts/checkout-source.sh
+
+      - name: Install dependencies without lifecycle scripts
+        working-directory: .private-gitlab-src
+        run: npm ci --ignore-scripts --no-audit --no-fund --no-progress
+
+      - name: Typecheck canonical source
+        working-directory: .private-gitlab-src
+        run: npm run typecheck
+
+      - name: Build ad-hoc signed macOS arm64 Node SEA
+        run: node scripts/build-native.mjs
+
+      - name: Smoke test real executable and negative guards
+        run: node scripts/verify-native.mjs
+
+      - name: Produce tar.gz, SHA256SUMS and evidence
+        run: node scripts/package-native.mjs
+
+      - name: Include quick start and verification instructions
+        shell: bash
+        run: |
+          cat > release/macos-arm64/README-MAC.txt <<'TXT'
+          AYE Captain macOS ARM64 — UNSIGNED DEVELOPER PILOT
+          Source of truth: private roktiw/aye-captain GitLab.
+          This is a native Node 26 SEA CLI, not a GUI, and is NOT notarized.
+
+          1. Extract the .tar.gz archive (this outer GitHub Actions artifact is a ZIP).
+          2. Run: ./aye --help
+          3. Run: ./aye doctor --json
+          4. Run: ./aye setup recommendations --platform macos --json
+
+          All commands above are read-only. Do not run provision --apply for a pilot.
+          Keep the accompanying share/ directory next to the aye executable.
+          Check the archive with shasum -a 256 -c SHA256SUMS.
+          Inspect manifest.json for the original GitLab SHA and signed binary digest.
+          macOS ad-hoc signing does not establish publisher identity.
+          TXT
+
+      - name: Upload build output (never source or credentials)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: "aye-cli-macos-arm64-pilot-${{ steps.source.outputs.source_sha }}"
+          path: release/macos-arm64/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
