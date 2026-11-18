@@ -1,0 +1,143 @@
+name: Build installable AYE macOS ARM64 preview
+on:
+  push:
+    branches:
+      - preview/aye-macos-lite-20261118
+    paths:
+      - "preview/aye-lite.mjs"
+      - ".github/workflows/aye-macos-lite.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout only the public preview source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Node 26.13.1 for macOS ARM64
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "26.13.1"
+
+      - name: Verify native host and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          test "$(node -p process.versions.node)" = "26.13.1"
+          node --check preview/aye-lite.mjs
+          node preview/aye-lite.mjs doctor --json >/dev/null
+          node preview/aye-lite.mjs status --json >/dev/null
+
+      - name: Package native Node SEA binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist release
+          cat > sea-config.json <<'JSON'
+          {
+            "main": "./preview/aye-lite.mjs",
+            "mainFormat": "module",
+            "output": "./dist/aye",
+            "useVfs": true,
+            "useCodeCache": false,
+            "useSnapshot": false,
+            "disableExperimentalSEAWarning": true,
+            "execArgvExtension": "none"
+          }
+          JSON
+          node --build-sea sea-config.json
+          chmod 755 dist/aye
+          /usr/bin/codesign --force --sign - dist/aye
+          /usr/bin/codesign --verify --verbose=2 dist/aye
+          /usr/bin/file dist/aye
+          /usr/bin/lipo -archs dist/aye | grep -w arm64
+          cp dist/aye release/aye
+
+      - name: Actual binary acceptance checks (no Node in PATH)
+        shell: bash
+        run: |
+          set -euo pipefail
+          env PATH=/usr/bin:/bin ./dist/aye --help | grep -F "AYE Captain macOS CLI PREVIEW"
+          env PATH=/usr/bin:/bin ./dist/aye version | grep -F "preview"
+          env PATH=/usr/bin:/bin ./dist/aye doctor --json > dist/doctor.json
+          env PATH=/usr/bin:/bin ./dist/aye status --json > dist/status.json
+          env PATH=/usr/bin:/bin ./dist/aye setup --plan --json > dist/plan.json
+          node -e "const f=require('fs');const d=JSON.parse(f.readFileSync('dist/doctor.json'));const s=JSON.parse(f.readFileSync('dist/status.json'));const p=JSON.parse(f.readFileSync('dist/plan.json'));if(d.host.platform!=='darwin'||d.host.arch!=='arm64'||d.host.nodeRuntime!=='26.13.1'||!d.readOnly||s.daemon!=='NOT_CONNECTED'||p.changesApplied!==false)process.exit(1)"
+          if env PATH=/usr/bin:/bin ./dist/aye provision --apply >/dev/null 2>&1; then
+            echo 'Unsafe unsupported operation unexpectedly accepted'; exit 1
+          fi
+
+      - name: Create user-installable ZIP contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release/install.command <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          cd "$(dirname "$0")"
+          if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+            echo "AYE installer requires macOS Apple Silicon (arm64)." >&2
+            exit 2
+          fi
+          /usr/bin/shasum -a 256 -c SHA256SUMS
+          /usr/bin/codesign --verify --verbose=2 ./aye
+          /bin/mkdir -p "$HOME/.local/bin"
+          /usr/bin/install -m 755 ./aye "$HOME/.local/bin/aye"
+          echo
+          echo "AYE preview installed at $HOME/.local/bin/aye"
+          "$HOME/.local/bin/aye" --help
+          echo
+          echo 'Run: ~/.local/bin/aye doctor --json'
+          echo 'Optional: add ~/.local/bin to your shell PATH.'
+          SH
+          chmod 755 release/install.command
+          cat > release/README-MAC.txt <<'TXT'
+          AYE Captain — minimal native macOS ARM64 CLI PREVIEW
+          =======================================================
+          This is a LIMITED, standalone, read-only evaluation executable.
+          It is not built from private GitLab canonical AYE Captain source.
+
+          Supported:  aye doctor --json
+                      aye status --json
+                      aye setup --plan
+                      aye --help
+                      aye version
+
+          1. Extract the ZIP file.
+          2. Open Terminal in the extracted folder.
+          3. Run: bash install.command
+          4. Run: ~/.local/bin/aye doctor --json
+
+          No sudo, no Node installation and no required network connection.
+          Installation writes only ~/.local/bin/aye.
+          Delete that file to uninstall.
+
+          SHA256SUMS is checked before installing. Binary has an ad-hoc
+          macOS signature only: NO Apple Developer ID, NO notarization.
+          macOS may warn about unnotarized downloaded applications.
+
+          The preview does not support actual GitLab, daemon, MCP, TUI,
+          provisioning, update or install operations.
+          It is a separate standalone preview, not an official release.
+          TXT
+          /usr/bin/shasum -a 256 release/aye | sed 's@  release/@  @' > release/SHA256SUMS
+          node -e "const f=require('fs');const c=require('crypto');const b=f.readFileSync('release/aye');f.writeFileSync('release/manifest.json',JSON.stringify({schema:'aye.preview.package/v1',sourceRepo:'github.com/roktiw/aye-captain',sourceBranch:process.env.GITHUB_REF_NAME,sourceSha:process.env.GITHUB_SHA,arch:'arm64',platform:'darwin',runtime:'node26.13.1-sea',binarySha256:c.createHash('sha256').update(b).digest('hex'),signature:'ad-hoc',notarized:false,canonicalGitLab:false,checks:['native','doctor','status','plan','invalid-args']},null,2)+'\\n')"
+          (cd release && shasum -a 256 -c SHA256SUMS)
+
+      - name: Upload installable AYE CLI preview
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aye-macos-arm64-installable-preview
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
